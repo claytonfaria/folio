@@ -228,11 +228,15 @@ ApplicationWindow {
 
             Image {
                 id: still
-                // Wait until the image belongs to its window before Qt picks
-                // the loading DPR, avoiding a second decode on attachment.
-                property bool readyToLoad: false
-                function startLoading() { readyToLoad = true }
-                Component.onCompleted: Qt.callLater(startLoading)
+                // Share the in-flight decode across scale reloads. The hidden
+                // child uses the same window/DPR and releases its pixels at Ready.
+                property Image keeper: Image {
+                    parent: still
+                    visible: false
+                    asynchronous: true
+                    autoTransform: true
+                    source: still.status === Image.Loading ? still.source : ""
+                }
                 visible: !flick.animated
                 width: flick.natural.width * flick.zoom
                 height: flick.natural.height * flick.zoom
@@ -242,7 +246,7 @@ ApplicationWindow {
                 autoTransform: true
                 smooth: true
                 mipmap: true
-                source: flick.animated || !readyToLoad ? "" : previewer.url
+                source: flick.animated ? "" : previewer.url
             }
             AnimatedImage {
                 id: moving

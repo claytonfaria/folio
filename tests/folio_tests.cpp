@@ -32,6 +32,7 @@
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QSettings>
+#include <QSemaphore>
 #include <QSignalSpy>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -58,6 +59,31 @@
 #include "thumbnails.h"
 #include "translator.h"
 #include "windows.h"
+
+// Lets the real preview use a counted, gated decoder in cache-lifetime tests.
+class PreviewProperties : public QQmlPropertyMap {
+    Q_OBJECT
+public:
+    PreviewProperties() : QQmlPropertyMap(this, nullptr) {}
+signals:
+    void changed();
+};
+
+class GatedPreviewImages : public QQuickImageProvider {
+public:
+    GatedPreviewImages() : QQuickImageProvider(QQuickImageProvider::Image) {}
+    std::atomic<int> reads{0};
+    QSemaphore release;
+    QImage requestImage(const QString &, QSize *size, const QSize &) override {
+        if (reads.fetch_add(1) == 0)
+            release.acquire();
+        QImage image(1600, 900, QImage::Format_RGB32);
+        image.fill(Qt::darkCyan);
+        if (size)
+            *size = image.size();
+        return image;
+    }
+};
 
 // Puts XDG_DATA_HOME, where the trash and recent files live, in `path` for
 // as long as the returned guard does.
@@ -6649,7 +6675,49 @@ private slots:
         QVERIFY(Previewer::markdownOpening(longFence, 600).count('|') <= 600 + 4);
     }
 
-    void previewImageWaitsForItsWindow()
+    void previewSharesAnInFlightDecodeAcrossReloads()
+    {
+        QTemporaryDir home;
+        Theme theme(home.filePath("theme"));
+        PreviewProperties preview;
+        preview.insert("item", QVariantMap{{"name", "Picture"}, {"path", "/picture.png"},
+                                           {"mime", "image/png"}, {"size", 1}});
+        preview.insert("viewer", "image");
+        preview.insert("url", "image://gated/picture");
+        preview.insert("count", 1);
+        preview.insert("index", 0);
+        preview.insert("type", "PNG");
+        QQmlEngine engine;
+        auto *images = new GatedPreviewImages;
+        engine.addImageProvider("gated", images);
+        const auto unblock = qScopeGuard([&] { images->release.release(); });
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("previewer", &preview);
+        QQmlComponent component(&engine, QUrl("qrc:/PreviewWindow.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        auto *view = root->property("view").value<QQuickItem *>();
+        QVERIFY(view);
+        auto *image = view->property("source").value<QObject *>();
+        QVERIFY(image);
+        QTRY_COMPARE(images->reads.load(), 1);
+        // Force Qt to drop and re-request the visible image while its first
+        // decode is blocked. Unlike changing source, this leaves keeper's URL
+        // alone, just as a window-DPR reload does. The uncached request is
+        // cancelled before the reader thread can start it.
+        QVERIFY(image->setProperty("cache", false));
+        QVERIFY(image->setProperty("cache", true));
+        images->release.release();
+        QTRY_COMPARE(image->property("status").toInt(), 1);
+        QCOMPARE(images->reads.load(), 1);
+        auto *keeper = image->property("keeper").value<QQuickItem *>();
+        QVERIFY(keeper);
+        QCOMPARE(keeper->window(), qobject_cast<QQuickItem *>(image)->window());
+        QVERIFY(!keeper->isVisible());
+        QVERIFY(keeper->property("source").toUrl().isEmpty());
+    }
+
+    void previewImageKeepsItsGeometryAndNavigation()
     {
         QTemporaryDir home;
         const QString path = home.filePath("large.png");
@@ -6676,9 +6744,6 @@ private slots:
         QVERIFY(view);
         auto *image = view->property("source").value<QObject *>();
         QVERIFY(image);
-        // A local file must not start decoding during component construction,
-        // before the completed tree has attached it to the window's screen.
-        QVERIFY(image->property("source").toUrl().isEmpty());
         QVERIFY(QTest::qWaitForWindowExposed(window));
         QTRY_COMPARE(image->property("status").toInt(), 1);
         QCOMPARE(image->property("source").toUrl(), QUrl::fromLocalFile(path));
@@ -6699,7 +6764,7 @@ private slots:
         QTRY_COMPARE(image->property("status").toInt(), 1);
         QTRY_COMPARE(view->property("natural").toSize(), smaller.size());
         QCOMPARE(image->property("source").toUrl(), QUrl::fromLocalFile(next));
-        // Destruction before the deferred callback must also be safe.
+        // Destroying a new view also releases its pending image references.
         std::unique_ptr<QObject> discarded(component.create());
         QVERIFY(discarded);
         discarded.reset();
