@@ -6649,6 +6649,64 @@ private slots:
         QVERIFY(Previewer::markdownOpening(longFence, 600).count('|') <= 600 + 4);
     }
 
+    void previewImageWaitsForItsWindow()
+    {
+        QTemporaryDir home;
+        const QString path = home.filePath("large.png");
+        QImage picture(3200, 2400, QImage::Format_RGB32);
+        picture.fill(Qt::darkCyan);
+        QVERIFY(picture.save(path));
+        Theme theme(home.filePath("theme"));
+        Previewer preview;
+        preview.start(path, false, "name");
+        QQmlEngine engine;
+        QStringList warnings;
+        connect(&engine, &QQmlEngine::warnings, &engine, [&](const QList<QQmlError> &errors) {
+            for (const auto &error : errors)
+                warnings << error.toString();
+        });
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("previewer", &preview);
+        QQmlComponent component(&engine, QUrl("qrc:/PreviewWindow.qml"));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        auto *window = qobject_cast<QQuickWindow *>(root.get());
+        QVERIFY(window);
+        auto *view = root->property("view").value<QQuickItem *>();
+        QVERIFY(view);
+        auto *image = view->property("source").value<QObject *>();
+        QVERIFY(image);
+        // A local file must not start decoding during component construction,
+        // before the completed tree has attached it to the window's screen.
+        QVERIFY(image->property("source").toUrl().isEmpty());
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        QTRY_COMPARE(image->property("status").toInt(), 1);
+        QCOMPARE(image->property("source").toUrl(), QUrl::fromLocalFile(path));
+        QCOMPARE(view->property("natural").toSize(), picture.size());
+        window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(window));
+        const double fit = view->property("zoom").toDouble();
+        QTest::keyClick(window, Qt::Key_Equal, Qt::ControlModifier);
+        QVERIFY(view->property("zoom").toDouble() > fit);
+        QTest::keyClick(window, Qt::Key_0, Qt::ControlModifier);
+        QCOMPARE(view->property("zoom").toDouble(), fit);
+        // The same component must still follow another selection.
+        const QString next = home.filePath("next.png");
+        QImage smaller(300, 200, QImage::Format_RGB32);
+        smaller.fill(Qt::red);
+        QVERIFY(smaller.save(next));
+        preview.show(next);
+        QTRY_COMPARE(image->property("status").toInt(), 1);
+        QTRY_COMPARE(view->property("natural").toSize(), smaller.size());
+        QCOMPARE(image->property("source").toUrl(), QUrl::fromLocalFile(next));
+        // Destruction before the deferred callback must also be safe.
+        std::unique_ptr<QObject> discarded(component.create());
+        QVERIFY(discarded);
+        discarded.reset();
+        QCoreApplication::processEvents();
+        QVERIFY2(warnings.isEmpty(), qPrintable(warnings.join('\n')));
+    }
+
     void previewerStepsThroughTheFolder()
     {
         QTemporaryDir dir;

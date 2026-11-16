@@ -228,6 +228,11 @@ ApplicationWindow {
 
             Image {
                 id: still
+                // Wait until the image belongs to its window before Qt picks
+                // the loading DPR, avoiding a second decode on attachment.
+                property bool readyToLoad: false
+                function startLoading() { readyToLoad = true }
+                Component.onCompleted: Qt.callLater(startLoading)
                 visible: !flick.animated
                 width: flick.natural.width * flick.zoom
                 height: flick.natural.height * flick.zoom
@@ -237,7 +242,7 @@ ApplicationWindow {
                 autoTransform: true
                 smooth: true
                 mipmap: true
-                source: flick.animated ? "" : previewer.url
+                source: flick.animated || !readyToLoad ? "" : previewer.url
             }
             AnimatedImage {
                 id: moving
