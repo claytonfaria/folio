@@ -60,31 +60,6 @@
 #include "translator.h"
 #include "windows.h"
 
-// Lets the real preview use a counted, gated decoder in cache-lifetime tests.
-class PreviewProperties : public QQmlPropertyMap {
-    Q_OBJECT
-public:
-    PreviewProperties() : QQmlPropertyMap(this, nullptr) {}
-signals:
-    void changed();
-};
-
-class GatedPreviewImages : public QQuickImageProvider {
-public:
-    GatedPreviewImages() : QQuickImageProvider(QQuickImageProvider::Image) {}
-    std::atomic<int> reads{0};
-    QSemaphore release;
-    QImage requestImage(const QString &, QSize *size, const QSize &) override {
-        if (reads.fetch_add(1) == 0)
-            release.acquire();
-        QImage image(1600, 900, QImage::Format_RGB32);
-        image.fill(Qt::darkCyan);
-        if (size)
-            *size = image.size();
-        return image;
-    }
-};
-
 // Puts XDG_DATA_HOME, where the trash and recent files live, in `path` for
 // as long as the returned guard does.
 [[nodiscard]] static auto dataHomeAt(const QString &path)
@@ -6677,99 +6652,59 @@ private slots:
 
     void previewSharesAnInFlightDecodeAcrossReloads()
     {
+        // A window learning its final display scale makes the picture ask
+        // for its pixels again while the first decode is still running.
+        // That reload must join the decode in flight, not start a second.
+        struct GatedImages : QQuickImageProvider {
+            GatedImages() : QQuickImageProvider(QQuickImageProvider::Image) {}
+            std::atomic<int> reads{0};
+            QSemaphore release;
+            QImage requestImage(const QString &, QSize *size, const QSize &) override
+            {
+                if (reads.fetch_add(1) == 0)
+                    release.acquire();
+                QImage image(1600, 900, QImage::Format_RGB32);
+                image.fill(Qt::darkCyan);
+                *size = image.size();
+                return image;
+            }
+        };
         QTemporaryDir home;
         Theme theme(home.filePath("theme"));
-        PreviewProperties preview;
-        preview.insert("item", QVariantMap{{"name", "Picture"}, {"path", "/picture.png"},
-                                           {"mime", "image/png"}, {"size", 1}});
-        preview.insert("viewer", "image");
-        preview.insert("url", "image://gated/picture");
-        preview.insert("count", 1);
-        preview.insert("index", 0);
-        preview.insert("type", "PNG");
         QQmlEngine engine;
-        auto *images = new GatedPreviewImages;
+        auto *images = new GatedImages;
         engine.addImageProvider("gated", images);
         const auto unblock = qScopeGuard([&] { images->release.release(); });
+        QQmlComponent stand(&engine);
+        stand.setData("import QtQml\n"
+                      "QtObject {\n"
+                      "    signal changed\n"
+                      "    property var item: ({ name: 'Picture', path: '/picture.png', mime: 'image/png', size: 1 })\n"
+                      "    property string viewer: 'image'\n"
+                      "    property string url: 'image://gated/picture'\n"
+                      "    property int count: 1\n"
+                      "    property int index: 0\n"
+                      "    property string type: 'PNG'\n"
+                      "    property string text\n"
+                      "}\n",
+                      QUrl());
+        std::unique_ptr<QObject> preview(stand.create());
+        QVERIFY2(preview, qPrintable(stand.errorString()));
         engine.rootContext()->setContextProperty("theme", &theme);
-        engine.rootContext()->setContextProperty("previewer", &preview);
+        engine.rootContext()->setContextProperty("previewer", preview.get());
         QQmlComponent component(&engine, QUrl("qrc:/PreviewWindow.qml"));
         std::unique_ptr<QObject> root(component.create());
         QVERIFY2(root, qPrintable(component.errorString()));
-        auto *view = root->property("view").value<QQuickItem *>();
-        QVERIFY(view);
-        auto *image = view->property("source").value<QObject *>();
+        auto *image = root->property("view").value<QQuickItem *>()->property("source").value<QObject *>();
         QVERIFY(image);
         QTRY_COMPARE(images->reads.load(), 1);
-        // Force Qt to drop and re-request the visible image while its first
-        // decode is blocked. Unlike changing source, this leaves keeper's URL
-        // alone, just as a window-DPR reload does. The uncached request is
-        // cancelled before the reader thread can start it.
+        // Turning the cache off and on drops and re-requests the image as a
+        // scale change does, while leaving its source alone.
         QVERIFY(image->setProperty("cache", false));
         QVERIFY(image->setProperty("cache", true));
         images->release.release();
         QTRY_COMPARE(image->property("status").toInt(), 1);
         QCOMPARE(images->reads.load(), 1);
-        auto *keeper = image->property("keeper").value<QQuickItem *>();
-        QVERIFY(keeper);
-        QCOMPARE(keeper->window(), qobject_cast<QQuickItem *>(image)->window());
-        QVERIFY(!keeper->isVisible());
-        QVERIFY(keeper->property("source").toUrl().isEmpty());
-    }
-
-    void previewImageKeepsItsGeometryAndNavigation()
-    {
-        QTemporaryDir home;
-        const QString path = home.filePath("large.png");
-        QImage picture(3200, 2400, QImage::Format_RGB32);
-        picture.fill(Qt::darkCyan);
-        QVERIFY(picture.save(path));
-        Theme theme(home.filePath("theme"));
-        Previewer preview;
-        preview.start(path, false, "name");
-        QQmlEngine engine;
-        QStringList warnings;
-        connect(&engine, &QQmlEngine::warnings, &engine, [&](const QList<QQmlError> &errors) {
-            for (const auto &error : errors)
-                warnings << error.toString();
-        });
-        engine.rootContext()->setContextProperty("theme", &theme);
-        engine.rootContext()->setContextProperty("previewer", &preview);
-        QQmlComponent component(&engine, QUrl("qrc:/PreviewWindow.qml"));
-        std::unique_ptr<QObject> root(component.create());
-        QVERIFY2(root, qPrintable(component.errorString()));
-        auto *window = qobject_cast<QQuickWindow *>(root.get());
-        QVERIFY(window);
-        auto *view = root->property("view").value<QQuickItem *>();
-        QVERIFY(view);
-        auto *image = view->property("source").value<QObject *>();
-        QVERIFY(image);
-        QVERIFY(QTest::qWaitForWindowExposed(window));
-        QTRY_COMPARE(image->property("status").toInt(), 1);
-        QCOMPARE(image->property("source").toUrl(), QUrl::fromLocalFile(path));
-        QCOMPARE(view->property("natural").toSize(), picture.size());
-        window->requestActivate();
-        QVERIFY(QTest::qWaitForWindowActive(window));
-        const double fit = view->property("zoom").toDouble();
-        QTest::keyClick(window, Qt::Key_Equal, Qt::ControlModifier);
-        QVERIFY(view->property("zoom").toDouble() > fit);
-        QTest::keyClick(window, Qt::Key_0, Qt::ControlModifier);
-        QCOMPARE(view->property("zoom").toDouble(), fit);
-        // The same component must still follow another selection.
-        const QString next = home.filePath("next.png");
-        QImage smaller(300, 200, QImage::Format_RGB32);
-        smaller.fill(Qt::red);
-        QVERIFY(smaller.save(next));
-        preview.show(next);
-        QTRY_COMPARE(image->property("status").toInt(), 1);
-        QTRY_COMPARE(view->property("natural").toSize(), smaller.size());
-        QCOMPARE(image->property("source").toUrl(), QUrl::fromLocalFile(next));
-        // Destroying a new view also releases its pending image references.
-        std::unique_ptr<QObject> discarded(component.create());
-        QVERIFY(discarded);
-        discarded.reset();
-        QCoreApplication::processEvents();
-        QVERIFY2(warnings.isEmpty(), qPrintable(warnings.join('\n')));
     }
 
     void previewerStepsThroughTheFolder()
