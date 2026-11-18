@@ -26,6 +26,9 @@ public:
     // cache when it is fresh, or a null image when none can be made.
     QImage load(const QString &path, const QString &mime, int size) const;
 
+    // Read a fresh thumbnail from any standard bucket, smallest first.
+    QImage cached(const QString &path) const;
+
     // A picture at `pixels` on its longest side, as sharp as the details
     // column draws it: read from the file when it's that small already,
     // otherwise from Folio's own cache (~/.cache/folio/sharp) when one's been

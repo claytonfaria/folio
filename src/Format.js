@@ -71,6 +71,11 @@ function thumb(path, mime, px, modified) {
     return "image://thumb/" + px + "/" + changed + "/" + encodeURIComponent(mime) + "/" + encodeURIComponent(path)
 }
 
+function cachedPreview(path, modified, width, height) {
+    const changed = modified ? modified.getTime() : 0
+    return "image://thumb/cached/" + Math.floor(width) + "/" + Math.floor(height) + "/" + changed + "/" + encodeURIComponent(path)
+}
+
 // A picture as sharp as `px` pixels on its longest side, for the details.
 function sharp(path, mime, px, modified) {
     const changed = modified ? modified.getTime() : 0

@@ -6443,6 +6443,8 @@ private slots:
         QVERIFY(picture.save(file));
 
         Thumbnails thumbnails(dir.filePath("cache"), {dir.filePath("none")});
+        QVERIFY(thumbnails.cached(file).isNull());
+        QVERIFY(!QFile::exists(dir.filePath("cache")));
         const QImage thumb = thumbnails.load(file, "image/png", 256);
         QCOMPARE(thumb.size(), QSize(256, 128));
 
@@ -6458,6 +6460,7 @@ private slots:
         QImage marked = stored;
         marked.fill(Qt::blue);
         QVERIFY(marked.save(cached));
+        QCOMPARE(thumbnails.cached(file).pixelColor(0, 0), QColor(Qt::blue));
         QCOMPARE(thumbnails.load(file, "image/png", 256).pixelColor(0, 0), QColor(Qt::blue));
         QCOMPARE(Thumbnails::bucketFor(128), QString("normal"));
         QCOMPARE(Thumbnails::bucketFor(512), QString("x-large"));
@@ -6946,23 +6949,31 @@ private slots:
             {
                 if (reads.fetch_add(1) == 0)
                     release.acquire();
-                QImage image(1600, 900, QImage::Format_RGB32);
+                QImage image(200, 100, QImage::Format_RGB32);
                 image.fill(Qt::darkCyan);
                 *size = image.size();
                 return image;
             }
         };
         QTemporaryDir home;
+        const QString path = home.filePath("picture.png");
+        QImage picture(200, 100, QImage::Format_RGB32);
+        picture.fill(Qt::red);
+        QVERIFY(picture.save(path));
+        Thumbnails thumbnails(home.filePath("cache"), {home.filePath("none")});
+        QCOMPARE(thumbnails.load(path, "image/png", 256).size(), QSize(256, 128));
         Theme theme(home.filePath("theme"));
         QQmlEngine engine;
         auto *images = new GatedImages;
         engine.addImageProvider("gated", images);
+        engine.addImageProvider("thumb", new ThumbnailProvider(&thumbnails));
         const auto unblock = qScopeGuard([&] { images->release.release(); });
         QQmlComponent stand(&engine);
         stand.setData("import QtQml\n"
                       "QtObject {\n"
                       "    signal changed\n"
-                      "    property var item: ({ name: 'Picture', path: '/picture.png', mime: 'image/png', size: 1 })\n"
+                      "    signal opened\n"
+                      "    property var item\n"
                       "    property string viewer: 'image'\n"
                       "    property string url: 'image://gated/picture'\n"
                       "    property int count: 1\n"
@@ -6973,14 +6984,25 @@ private slots:
                       QUrl());
         std::unique_ptr<QObject> preview(stand.create());
         QVERIFY2(preview, qPrintable(stand.errorString()));
+        QVERIFY(preview->setProperty("item", QVariantMap{
+            {"name", "Picture"}, {"path", path}, {"mime", "image/png"},
+            {"size", QFileInfo(path).size()}, {"modified", QFileInfo(path).lastModified()}
+        }));
         engine.rootContext()->setContextProperty("theme", &theme);
         engine.rootContext()->setContextProperty("previewer", preview.get());
         QQmlComponent component(&engine, QUrl("qrc:/PreviewWindow.qml"));
         std::unique_ptr<QObject> root(component.create());
         QVERIFY2(root, qPrintable(component.errorString()));
-        auto *image = root->property("view").value<QQuickItem *>()->property("source").value<QObject *>();
+        auto *view = root->property("view").value<QQuickItem *>();
+        QVERIFY(view);
+        auto *image = view->property("source").value<QObject *>();
+        auto *thumbnail = view->findChild<QQuickItem *>("previewThumbnail");
         QVERIFY(image);
+        QVERIFY(thumbnail);
         QTRY_COMPARE(images->reads.load(), 1);
+        QTRY_VERIFY(thumbnail->isVisible());
+        QCOMPARE(view->property("natural").toSize(), picture.size());
+        QCOMPARE(thumbnail->size(), QSizeF(picture.size()));
         // Turning the cache off and on drops and re-requests the image as a
         // scale change does, while leaving its source alone.
         QVERIFY(image->setProperty("cache", false));
@@ -6988,6 +7010,10 @@ private slots:
         images->release.release();
         QTRY_COMPARE(image->property("status").toInt(), 1);
         QCOMPARE(images->reads.load(), 1);
+        QVERIFY(!thumbnail->isVisible());
+        QVERIFY(thumbnail->property("source").toUrl().isEmpty());
+        QCOMPARE(view->property("natural").toSize(), picture.size());
+        QVERIFY(!QFile::exists(home.filePath("cache/normal/" + Thumbnails::cacheKey(path))));
     }
 
     void previewerStepsThroughTheFolder()

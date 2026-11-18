@@ -211,6 +211,23 @@ void Thumbnails::keep(const QImage &image, const QString &path, int pixels, cons
     }
 }
 
+QImage Thumbnails::cached(const QString &path) const {
+    const QFileInfo info(path);
+    if (!info.isFile())
+        return {};
+
+    for (const int size : {128, 256, 512, 1024}) {
+        QImageReader reader(cachePath(path, size), "png");
+        const QSize pixels = reader.size();
+        if (!pixels.isValid() || pixels.width() > size || pixels.height() > size)
+            continue;
+        const QImage image = reader.read();
+        if (madeFor(image, info.lastModified()) && image.text("Thumb::URI") == fileUri(path))
+            return image;
+    }
+    return {};
+}
+
 QImage Thumbnails::load(const QString &path, const QString &mime, int size) const {
     const QFileInfo info(path);
     if (!info.isFile())
@@ -464,12 +481,31 @@ public:
     void work(bool &told) {
         // id = <size>/<modified>/<url-encoded mime>/<url-encoded path>, or
         // page/<size>/<modified>/<paper>/<ink>/<url-encoded path> for text.
+        // cached/<width>/<height>/<modified>/<url-encoded path> fits a cached preview.
         // The time is only there to tell Qt's own cache apart; load() checks
         // the file's.
         const QStringList parts = m_id.split('/');
         // A tile scrolled away before its turn came shouldn't keep the pool
         // from the ones on screen.
-        if (!m_cancelled && parts.size() >= 5 && parts.at(0) == "sharp") {
+        if (!m_cancelled && parts.size() >= 5 && parts.at(0) == "cached") {
+            const QString path = QUrl::fromPercentEncoding(parts.mid(4).join('/').toUtf8());
+            const QImage thumbnail = m_thumbnails->cached(path);
+            if (!thumbnail.isNull()) {
+                // Read the header for geometry. The full Image still decodes the pixels.
+                QImageReader reader(path);
+                QSize original = reader.size();
+                if (reader.transformation().testFlag(QImageIOHandler::TransformationRotate90))
+                    original.transpose();
+                const QSize viewport(qBound(1, parts.at(1).toInt(), 2048),
+                                     qBound(1, parts.at(2).toInt(), 2048));
+                if (!original.isEmpty()) {
+                    if (original.width() > viewport.width() || original.height() > viewport.height())
+                        original.scale(viewport, Qt::KeepAspectRatio);
+                    m_image = thumbnail.scaled(original.expandedTo(QSize(1, 1)), Qt::IgnoreAspectRatio,
+                                               Qt::SmoothTransformation);
+                }
+            }
+        } else if (!m_cancelled && parts.size() >= 5 && parts.at(0) == "sharp") {
             const int pixels = qBound(256, parts.at(1).toInt(), 8192);
             const QString mime = QUrl::fromPercentEncoding(parts.at(3).toUtf8());
             const QString path = QUrl::fromPercentEncoding(parts.mid(4).join('/').toUtf8());
@@ -488,8 +524,7 @@ public:
             if (!made.isNull())
                 thumbnails->keep(made, path, pixels, modified);
             return;
-        }
-        if (!m_cancelled && parts.size() >= 6 && parts.at(0) == "page") {
+        } else if (!m_cancelled && parts.size() >= 6 && parts.at(0) == "page") {
             const QString path = QUrl::fromPercentEncoding(parts.mid(5).join('/').toUtf8());
             m_image = Thumbnails::textPage(path, qBound(64, parts.at(1).toInt(), 1024),
                                            QColor::fromString("#" + parts.at(3)), QColor::fromString("#" + parts.at(4)));

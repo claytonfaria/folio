@@ -213,25 +213,72 @@ ApplicationWindow {
 
             readonly property bool animated: win.viewer === "animated"
             readonly property var source: animated ? moving : still
-            readonly property size natural: source.status === Image.Ready ? Qt.size(source.implicitWidth, source.implicitHeight) : Qt.size(1, 1)
+            readonly property bool canZoom: animated || still.status === Image.Ready
+            readonly property size natural: source.status === Image.Ready ? Qt.size(source.implicitWidth, source.implicitHeight)
+                                            : quick.visible ? Qt.size(quick.implicitWidth, quick.implicitHeight) : Qt.size(1, 1)
             readonly property real fitScale: Math.min(1, (width - 48) / natural.width, (height - 48) / natural.height)
             property real zoom: fitScale
 
             onFitScaleChanged: if (!zoomed) zoom = fitScale
             property bool zoomed: false
 
-            function zoomBy(factor) { zoomed = true; zoom = Math.max(0.05, Math.min(16, zoom * factor)) }
+            function zoomBy(factor) {
+                if (!canZoom)
+                    return
+                zoomed = true
+                zoom = Math.max(0.05, Math.min(16, zoom * factor))
+            }
             function fit() { zoomed = false; zoom = fitScale }
             function scroll(direction) { contentY = Math.max(0, Math.min(contentHeight - height, contentY + direction * 80)) }
+            function loadStill() {
+                headStart.stop()
+                still.source = ""
+                const item = previewer.item
+                quick.source = previewer.viewer === "image" && item.path && !item.mime.startsWith("image/svg")
+                               && !/@[2-9]x\.[^.]+$/.test(item.path)
+                               ? Format.cachedPreview(item.path, item.modified, win.width, win.height) : ""
+                if (quick.status === Image.Loading)
+                    headStart.start()
+                else
+                    showStill()
+            }
+            function showStill() {
+                headStart.stop()
+                if (previewer.viewer === "image")
+                    still.source = previewer.url
+            }
 
             contentWidth: Math.max(width, natural.width * zoom)
             contentHeight: Math.max(height, natural.height * zoom)
 
+            Component.onCompleted: loadStill()
             Connections {
                 target: previewer
-                function onChanged() { flick.fit() }
+                function onChanged() {
+                    flick.loadStill()
+                    flick.fit()
+                }
             }
 
+            // Qt delivers both images on one reader thread. Give a warm thumb
+            // a chance to arrive before the full decode occupies that thread.
+            Timer {
+                id: headStart
+                interval: 50
+                onTriggered: flick.showStill()
+            }
+
+            Image {
+                id: quick
+                objectName: "previewThumbnail"
+                anchors.fill: still
+                asynchronous: true
+                cache: false
+                fillMode: Image.PreserveAspectFit
+                visible: !flick.animated && status === Image.Ready
+                         && still.status !== Image.Ready && still.status !== Image.Error
+                onStatusChanged: if (headStart.running && (status === Image.Ready || status === Image.Error)) flick.showStill()
+            }
             Image {
                 id: still
                 // Share the in-flight decode across scale reloads. The hidden
@@ -252,7 +299,7 @@ ApplicationWindow {
                 autoTransform: true
                 smooth: true
                 mipmap: true
-                source: flick.animated ? "" : previewer.url
+                onStatusChanged: if (status === Image.Ready || status === Image.Error) quick.source = ""
             }
             AnimatedImage {
                 id: moving
@@ -266,6 +313,7 @@ ApplicationWindow {
             }
 
             TapHandler {
+                enabled: flick.canZoom
                 onDoubleTapped: flick.zoomed && Math.abs(flick.zoom - 1) < 0.01 ? flick.fit() : (flick.zoomed = true, flick.zoom = 1)
             }
             WheelHandler {
